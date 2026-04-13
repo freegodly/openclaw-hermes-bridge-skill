@@ -1,5 +1,5 @@
 {
-  "hermesMcpUrl": "http://localhost:18792/mcp",
+  "hermesCommand": "hermes",
   "privilegedUsers": [],
   "keywords": [
     "hermes",
@@ -13,8 +13,5 @@
     "帮我",
     "请帮我"
   ],
-  "timeout": 30000,
-  "transport": "stdio",
-  "command": "hermes",
-  "args": ["mcp", "serve"]
+  "timeout": 60000
 }

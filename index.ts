@@ -1,8 +1,8 @@
 /**
  * Hermes Bridge Skill for OpenClaw
  *
- * Routes complex messages to Hermes MCP Server for AI processing.
- * Simple messages are handled directly by OpenClaw.
+ * Routes complex messages to Hermes AI for processing.
+ * Uses hermes chat CLI for AI responses.
  */
 
 import * as fs from "fs";
@@ -10,22 +10,20 @@ import * as path from "path";
 import { spawn } from "child_process";
 
 interface HermesBridgeConfig {
-  hermesMcpUrl: string;
+  hermesCommand: string;
   privilegedUsers: string[];
   keywords: string[];
   timeout: number;
-  transport: "streamable-http" | "stdio";
-  command: string;
-  args: string[];
 }
 
 // Default configuration
 const DEFAULT_CONFIG: HermesBridgeConfig = {
-  hermesMcpUrl: "http://localhost:18792/mcp",
+  hermesCommand: "hermes",
   privilegedUsers: [],
   keywords: [
     "hermes",
     "analyze",
+    "analyse",
     "分析",
     "代码生成",
     "complex",
@@ -34,10 +32,7 @@ const DEFAULT_CONFIG: HermesBridgeConfig = {
     "帮我",
     "请帮我",
   ],
-  timeout: 30000,
-  transport: "stdio",
-  command: "hermes",
-  args: ["mcp", "serve"],
+  timeout: 60000, // 60 seconds for AI response
 };
 
 /**
@@ -106,12 +101,26 @@ export async function handleHermesBridge(
     return { routed: false };
   }
 
-  // Route to Hermes via MCP (only stdio mode supported)
+  // Route to Hermes AI via CLI
   try {
-    const response = await callHermesMCP(message, config);
+    // Extract the actual message (remove /hermes or /ask-hermes prefix)
+    let query = message;
+    const lowerMessage = message.toLowerCase().trim();
+    if (lowerMessage.startsWith("/hermes")) {
+      query = message.slice("/hermes".length).trim();
+    } else if (lowerMessage.startsWith("/ask-hermes")) {
+      query = message.slice("/ask-hermes".length).trim();
+    }
+
+    // If no query after command, use a default prompt
+    if (!query) {
+      query = "你好";
+    }
+
+    const response = await callHermesChat(query, config);
     return { routed: true, response };
   } catch (error) {
-    console.error("Hermes MCP call failed:", error);
+    console.error("Hermes AI call failed:", error);
     return {
       routed: true,
       error: error instanceof Error ? error.message : "Hermes unavailable",
@@ -120,20 +129,20 @@ export async function handleHermesBridge(
 }
 
 /**
- * Call Hermes MCP Server via stdio
+ * Call Hermes AI via CLI chat command
  */
-async function callHermesMCP(
-  message: string,
+async function callHermesChat(
+  query: string,
   config: HermesBridgeConfig
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(config.command, config.args, {
+    const proc = spawn(config.hermesCommand, ["chat", "-Q", "-q", query], {
       stdio: ["pipe", "pipe", "pipe"],
+      timeout: config.timeout,
     });
 
     let stdout = "";
     let stderr = "";
-    let requestId = 1;
 
     proc.stdout.on("data", (data) => {
       stdout += data.toString();
@@ -146,93 +155,79 @@ async function callHermesMCP(
     proc.on("close", (code) => {
       if (code !== 0) {
         reject(new Error(`Hermes exited with code ${code}: ${stderr}`));
+        return;
+      }
+
+      // Parse the output - extract just the AI response
+      // hermes chat -Q outputs in format:
+      // ╭─ ⚕ Hermes ───────────────────────────────────────────────────────────╮
+      // AI response text
+      // ╰──────────────────────────────────────────────────────────────────────╯
+      // session_id: xxx
+
+      const response = parseHermesOutput(stdout);
+      if (response) {
+        resolve(response);
+      } else if (stdout.trim()) {
+        // Fallback: return the raw output cleaned up
+        resolve(cleanHermesOutput(stdout));
+      } else {
+        reject(new Error("Hermes returned empty response"));
       }
     });
 
     proc.on("error", (err) => {
       reject(new Error(`Failed to start Hermes: ${err.message}`));
     });
-
-    // Give process time to start
-    setTimeout(() => {
-      // Send initialize
-      const initRequest = {
-        jsonrpc: "2.0",
-        id: String(requestId++),
-        method: "initialize",
-        params: {
-          protocolVersion: "2024-11-05",
-          capabilities: {},
-          clientInfo: { name: "hermes-bridge-skill", version: "1.0.0" },
-        },
-      };
-
-      proc.stdin.write(JSON.stringify(initRequest) + "\n");
-
-      // Send notifications/initialized
-      setTimeout(() => {
-        proc.stdin.write(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            method: "notifications/initialized",
-            params: {},
-          }) + "\n"
-        );
-
-        // Call messages_send tool with the user's message
-        const toolRequest = {
-          jsonrpc: "2.0",
-          id: String(requestId++),
-          method: "tools/call",
-          params: {
-            name: "messages_send",
-            arguments: {
-              target: "console", // Default target
-              message: message,
-            },
-          },
-        };
-
-        proc.stdin.write(JSON.stringify(toolRequest) + "\n");
-
-        // Wait for response
-        setTimeout(() => {
-          proc.kill();
-          // Parse the last response from stdout
-          const lines = stdout.trim().split("\n");
-          let lastResult = "";
-          for (const line of lines) {
-            if (line.includes("result")) {
-              try {
-                const parsed = JSON.parse(line);
-                if (parsed.result) {
-                  if (typeof parsed.result === "string") {
-                    lastResult = parsed.result;
-                  } else {
-                    lastResult = JSON.stringify(parsed.result);
-                  }
-                }
-              } catch {
-                // Try to extract text from error
-              }
-            }
-          }
-          if (lastResult) {
-            resolve(lastResult);
-          } else if (stderr) {
-            resolve(`Hermes: ${stderr.slice(0, 500)}`);
-          } else {
-            resolve("Hermes responded without result");
-          }
-        }, 3000);
-      }, 1000);
-    }, 1000);
   });
+}
+
+/**
+ * Parse Hermes chat output to extract the AI response
+ */
+function parseHermesOutput(output: string): string | null {
+  // Remove box-drawing characters and session info
+  const lines = output.split("\n");
+  const responseLines: string[] = [];
+  let inResponse = false;
+
+  for (const line of lines) {
+    // Skip the header/footer lines
+    if (line.includes("─ ⚕ Hermes ─") || line.includes("─") || line.includes("╰")) {
+      continue;
+    }
+    // Skip session_id line
+    if (line.trim().startsWith("session_id:")) {
+      continue;
+    }
+    // Everything else is response content
+    if (line.trim()) {
+      responseLines.push(line);
+    }
+  }
+
+  if (responseLines.length > 0) {
+    return responseLines.join("\n").trim();
+  }
+  return null;
+}
+
+/**
+ * Clean up Hermes output as fallback
+ */
+function cleanHermesOutput(output: string): string {
+  // Remove box-drawing characters, headers, footers
+  return output
+    .replace(/[╭╮╯╰─]/g, "")
+    .replace(/⚕ Hermes.*?╮/g, "")
+    .replace(/session_id:.*/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 // Export for OpenClaw skill system
 export default {
   name: "hermes",
-  description: "Route complex messages to Hermes MCP Server",
+  description: "Route complex messages to Hermes AI for processing",
   handle: handleHermesBridge,
 };
