@@ -1,0 +1,20 @@
+{
+  "hermesMcpUrl": "http://localhost:18792/mcp",
+  "privilegedUsers": [],
+  "keywords": [
+    "hermes",
+    "analyze",
+    "analyse",
+    "分析",
+    "代码生成",
+    "complex",
+    "reasoning",
+    "推理",
+    "帮我",
+    "请帮我"
+  ],
+  "timeout": 30000,
+  "transport": "stdio",
+  "command": "hermes",
+  "args": ["mcp", "serve"]
+}
